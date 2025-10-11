@@ -1,152 +1,199 @@
 #!/usr/bin/env python3
 """
-email_to_ace.py
-
-Compute ACE (Punycode / IDNA) for an input email or domain.
+emailtoace.py — robust converter: email/domain/label -> ACE (xn--...), lab-safe.
 
 Usage examples:
-  # domain
-  python email_to_ace.py "gmáil.com"
+  python emailtoace.py "security@gm𝘼il.com"
+  python emailtoace.py "gm𝘼il.com"
+  python emailtoace.py "gm𝘼il" --tld com
+  python emailtoace.py "𝘼" --label-only         # single glyph -> ace for label
+  python emailtoace.py "security@gm𝘼il.com" --ascii-local
+  python emailtoace.py --batch list.txt         # file with one candidate per line
 
-  # email (will punycode the domain part only)
-  python email_to_ace.py "security@gmáil.com"
-
-  # make local-part ASCII-safe too (strip diacritics + replace non-ascii)
-  python email_to_ace.py "ṡecurity@gmáil.com" --ascii-local
-
-  # decode ACE domain back to unicode
-  python email_to_ace.py "xn--gml-6na.com" --decode
-
-  # show codepoints (helpful to debug which accent/codepoint you used)
-  python email_to_ace.py "gma\u0301il.com" --show-codepoints
-
-Dependency:
-  pip install idna
+Notes:
+ - This script only helps produce ACE domains for domains/labels you control.
+ - It will not register domains for you.
+ - Use responsibly and only on domains you own or in lab environments.
 """
-
 from __future__ import annotations
-import argparse
-import unicodedata
-import re
-import sys
-from typing import Tuple
+import argparse, sys, unicodedata, re
+from typing import Tuple, List
 
 try:
     import idna
 except Exception:
-    sys.exit("Missing dependency: run 'pip install idna'")
+    sys.exit("Missing dependency: pip install idna")
 
-def normalize_nfc(s: str) -> str:
-    return unicodedata.normalize("NFC", s)
+# Focused homoglyph suggestions for domain-label usage (expand as needed)
+SUGGESTED_SUBS = {
+    'a': ['á','à','â','ä','а'],   # Cyrillic a (U+0430) last
+    'e': ['é','è','ê','е'],
+    'i': ['í','ì','ï','ι'],
+    'o': ['ó','ò','ô','ö','о'],
+    's': ['ś','š','ѕ'],
+    'm': ['м'],
+    'g': ['ɡ'],
+    'l': ['ł','ⅼ'],
+}
+
+def normalize_nfkc_then_nfc(s: str) -> str:
+    """Try compatibility folding then canonical composition."""
+    nfkc = unicodedata.normalize("NFKC", s)
+    return unicodedata.normalize("NFC", nfkc)
 
 def show_codepoints(s: str) -> str:
     return " ".join(f"U+{ord(c):04X}" for c in s)
 
-def ascii_safe_local(local: str) -> str:
-    # Remove diacritics, replace non-ascii with underscore, and collapse invalid chars
-    nf = normalize_nfc(local)
+def split_input(inp: str) -> Tuple[str,str,bool]:
+    """
+    Returns (local, domain, label_only_flag)
+    - if input is an email, returns local, domain
+    - if input is domain-only, returns "", domain
+    - if label_only flag True, domain is label (no dots)
+    """
+    inp = inp.strip()
+    if "@" in inp:
+        local, domain = inp.split("@",1)
+        return local, domain, False
+    # treat single-token without dot as label-only
+    if "." not in inp:
+        return "", inp, True
+    return "", inp, False
+
+def try_idna_encode(domain: str):
+    """Try to idna.encode a full domain like 'label.tld' after normalization."""
+    dom_norm = normalize_nfkc_then_nfc(domain)
+    try:
+        ace = idna.encode(dom_norm).decode()
+        return ace, dom_norm
+    except Exception as e:
+        # if fails, raise with message
+        raise RuntimeError(f"IDNA encode failed for '{domain}' (after NFKC/NFC -> '{dom_norm}'): {e}") from e
+
+def suggest_label_variants(label: str, limit: int = 20) -> List[str]:
+    """Return a short list of label variants by single-char substitution using SUGGESTED_SUBS."""
+    chars = list(label)
+    suggestions = []
+    for i,ch in enumerate(chars):
+        key = ch.lower()
+        if key in SUGGESTED_SUBS:
+            for sub in SUGGESTED_SUBS[key]:
+                cand = ''.join(chars[:i] + [sub] + chars[i+1:])
+                suggestions.append(cand)
+    # dedupe preserve order
+    seen = set(); out=[]
+    for s in suggestions:
+        if s not in seen:
+            out.append(s); seen.add(s)
+        if len(out) >= limit:
+            break
+    return out
+
+def process_candidate(raw_input: str, local_override: str, tld: str, ascii_local: bool, show_cp: bool):
+    local, domain_or_label, label_only = split_input(raw_input)
+
+    # If local_override provided via arg, don't override if local exists; only used for label-only input
+    if not local and local_override:
+        local = local_override
+
+    # Show basic info
+    print(f"\nCandidate input: {raw_input}")
+    if show_cp:
+        print(" Raw codepoints:", show_codepoints(raw_input))
+
+    # If label_only (no dot, no @) treat domain as label+TLD later
+    if label_only:
+        label = domain_or_label
+        domain = f"{label}.{tld}"
+        is_label_only = True
+    else:
+        domain = domain_or_label
+        is_label_only = False
+
+    # Normalize / compat-fold domain
+    try:
+        ace, used_dom = try_idna_encode(domain)
+        # success
+        print(" Normalized domain used:", used_dom)
+        print(" ACE domain:", ace)
+        out_local = local or local_override or "user"
+        if ascii_local:
+            out_local = ascii_localize(out_local)
+        if local:
+            # present both forms
+            print(" Ready emails:")
+            print("  Unicode (raw):", f"{local}@{used_dom}")
+            print("  ACE (mailbox) :", f"{out_local}@{ace}")
+        else:
+            print(" Ready domain:", ace)
+        return
+    except Exception as e:
+        print(" ERROR:", e)
+
+    # If encode failed, attempt smarter fallbacks:
+    # 1) if domain included an '@' earlier we should not have appended .com; but we split - so this is domain-only issue
+    # 2) Try suggestions on label(s) (only substitute characters inside labels)
+    print(" Attempting suggestions for domain labels (safe allowed homoglyphs)...")
+    labels = domain.split(".")
+    tried = 0
+    for idx, lab in enumerate(labels):
+        variants = suggest_label_variants(lab)
+        for v in variants:
+            new_labels = labels.copy()
+            new_labels[idx] = v
+            cand_dom = ".".join(new_labels)
+            try:
+                ace_v, used_dom_v = try_idna_encode(cand_dom)
+                out_local = local or local_override or "user"
+                if ascii_local:
+                    out_local = ascii_localize(out_local)
+                print(f" Suggestion success: {cand_dom} -> {ace_v}")
+                print("  Ready email:", f"{out_local}@{ace_v}")
+                tried += 1
+            except Exception as ex2:
+                # suggestion failed, continue
+                continue
+            if tried >= 6:
+                return
+    print(" No suggestion produced a valid ACE. Try a different allowed homoglyph (accent/Cyrillic) or register a domain you own.")
+
+def ascii_localize(local: str) -> str:
+    # strip diacritics and non-ascii -> underscores
+    nf = normalize_nfkc_then_nfc(local)
     stripped = "".join(ch for ch in nf if not unicodedata.combining(ch))
     safe = re.sub(r"[^\x00-\x7f]", "_", stripped)
     safe = re.sub(r"[^A-Za-z0-9._%+\-]", "_", safe)
     return safe or "user"
 
-def encode_domain_to_ace(domain: str) -> str:
-    domain_nfc = normalize_nfc(domain)
-    ace = idna.encode(domain_nfc).decode()
-    return ace
-
-def decode_ace_to_unicode(ace_domain: str) -> str:
-    return idna.decode(ace_domain)
-
-def split_email_or_domain(inp: str) -> Tuple[str, str]:
-    if "@" in inp:
-        local, domain = inp.split("@", 1)
-        return local, domain
-    else:
-        return "", inp
+def batch_process(file_path: str, **kwargs):
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            process_candidate(s, **kwargs)
 
 def main():
-    p = argparse.ArgumentParser(description="Convert email or domain to ACE (Punycode) and inspect codepoints.")
-    p.add_argument("input", help="Email (local@domain) or domain (e.g. gmáil.com)")
-    p.add_argument("--ascii-local", action="store_true",
-                   help="Make the local-part ASCII-safe (strip diacritics + replace non-ASCII).")
-    p.add_argument("--decode", action="store_true",
-                   help="If input is ACE domain (xn--...), decode back to Unicode and print.")
-    p.add_argument("--show-codepoints", action="store_true",
-                   help="Show Unicode codepoints for the input parts (useful for debugging).")
+    p = argparse.ArgumentParser(description="Robust email/domain -> ACE (xn--) converter (lab-only).")
+    p.add_argument("input", nargs="?", help="Email, domain, label or path to batch file (use --batch for file).")
+    p.add_argument("--local", default="security", help="default local-part when input is a label")
+    p.add_argument("--tld", default="com", help="TLD to append for bare labels")
+    p.add_argument("--ascii-local", action="store_true", help="make local-part ASCII safe for SMTP")
+    p.add_argument("--show-codepoints", action="store_true", help="show codepoints for the raw input")
+    p.add_argument("--batch", action="store_true", help="treat INPUT as a file path and process each line")
     args = p.parse_args()
 
-    inp = args.input.strip()
-
-    if args.decode:
-        # decode ACE (domain or email domain)
-        if "@" in inp:
-            local, domain = split_email_or_domain(inp)
-            try:
-                decoded = decode_ace_to_unicode(domain)
-                print(f"Decoded: {local}@{decoded}")
-            except Exception as e:
-                print(f"IDNA decode error for domain {domain!r}: {e}")
-        else:
-            try:
-                print(f"Decoded: {decode_ace_to_unicode(inp)}")
-            except Exception as e:
-                print(f"IDNA decode error for {inp!r}: {e}")
+    if args.batch:
+        if not args.input:
+            print("Batch mode requires a file path as INPUT.")
+            sys.exit(2)
+        batch_process(args.input, local_override=args.local, tld=args.tld, ascii_local=args.ascii_local, show_cp=args.show_codepoints)
         return
 
-    local, domain = split_email_or_domain(inp)
+    if not args.input:
+        p.print_help(); sys.exit(1)
 
-    if args.show_codepoints:
-        if local:
-            print("Local-part codepoints:")
-            print(" ", show_codepoints(local))
-        print("Domain (raw) codepoints:")
-        print(" ", show_codepoints(domain))
-        print("----")
-
-    # Normalize and encode domain
-    domain_nfc = normalize_nfc(domain)
-    try:
-        ace = encode_domain_to_ace(domain_nfc)
-    except Exception as e:
-        print(f"ERROR: IDNA encode failed for domain {domain!r}: {e}")
-        sys.exit(2)
-
-    # Optionally make local ascii safe
-    out_local = local
-    if local and args.ascii_local:
-        out_local = ascii_safe_local(local)
-
-    # Print results
-    if local:
-        print(f"Input email:        {inp}")
-        print(f"Local-part (NFC):   {normalize_nfc(local)}")
-        if args.show_codepoints:
-            print("  local-part codepoints:", show_codepoints(normalize_nfc(local)))
-        print(f"Domain (NFC):       {domain_nfc}")
-        if args.show_codepoints:
-            print("  domain codepoints: ", show_codepoints(domain_nfc))
-        print(f"ACE domain:         {ace}")
-        print()
-        print("Ready-to-use forms:")
-        print(f"  Unicode email (raw): {local}@{domain_nfc}")
-        print(f"  ACE email (mailbox): {out_local}@{ace}")
-        if args.ascii_local and local != out_local:
-            print(f"  Note: ascii-local used -> {out_local}@{ace}")
-    else:
-        # domain only
-        print(f"Input domain: {domain}")
-        print(f"Domain (NFC): {domain_nfc}")
-        if args.show_codepoints:
-            print("  domain codepoints: ", show_codepoints(domain_nfc))
-        print(f"ACE domain:   {ace}")
-
-    print("\nNotes:")
-    print(" - IDNA/Punycode applies to domain labels (right of @).")
-    print(" - For PoC / mail deliverability: prefer ASCII local-parts and punycode the domain (ACE).")
-    print(" - Always normalize input to NFC before encoding (this script does that).")
-    print(" - If you see unexpected ACEs, check codepoints (--show-codepoints) to diagnose grave vs acute vs combining marks.")
+    process_candidate(args.input, local_override=args.local, tld=args.tld, ascii_local=args.ascii_local, show_cp=args.show_codepoints)
 
 if __name__ == "__main__":
     main()
-
