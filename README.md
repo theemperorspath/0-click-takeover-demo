@@ -1,4 +1,4 @@
-Full setup instructions + live video demo of the POC are available here: 
+Full setup instructions + live video demo of the POC are available here: https://medium.com/@theemperorspath/the-most-underrated-0-click-ato-full-lab-writeup-flask-demo-a21d9f387629
 
 Disclosure & disclaimer (must read)
 
