@@ -2,13 +2,7 @@ Full setup instructions + live video demo of the POC are available here:
 https://medium.com/@theemperorspath/the-most-underrated-0-click-ato-full-lab-writeup-flask-demo-a21d9f387629
 
 Full cheatsheet to hunt this vuln + visual diagram:
-<iframe 
-  src="https://theemperorspath.github.io/punycode-ATO-visual" 
-  width="100%" 
-  height="400px" 
-  title="Embedded HTML Demo" 
-  sandbox="allow-scripts"  <!-- Allows the embedded HTML to run scripts -->
-></iframe>
+https://theemperorspath.github.io/punycode-ATO-visual/
 
 
 Disclosure & disclaimer (must read)
